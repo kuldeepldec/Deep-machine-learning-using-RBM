@@ -1,0 +1,321 @@
+---
+title: "Machine learning using RBM"
+author: "kuldeep singh bhati"
+output: html_document
+---
+
+```{r, echo=FALSE} 
+library(TTR)
+library(dplyr)
+library(magrittr)
+library(randomUniformForest)
+library(caret)
+library(darch)
+library(rminer)
+library(kohonen)
+library(pracma)
+
+```
+The project is about to train indicators input to a RBM.We are predicting that next bar of euro dollar will be up or down. After predicting we are testing on next 1000 bars. We have used darch package for training RBM.
+
+##Euro/dollar data taken from 2007 to 2016 26 minute data
+```{r}
+set.seed(2)
+price<-read.table("euro.txt",header=TRUE,sep=",")
+price<-subset(price[,3:6])
+```
+
+Median price of high and low
+
+```{r}
+Med <- (price[,2] + price[,3])/2
+CO <- price[, 4] - price[, 1]
+```
+
+Add Med and CO prices to the matrix
+
+```{r}
+price <- cbind(price, Med, CO)
+```
+## First generate input signals from indicator to train
+```{r}
+Input<- function(p = 14){
+   
+    adx <- ADX(price, n = p) %>% as.data.frame %>% 
+    mutate(.,oscDX = DIp - DIn) %>% 
+    transmute(.,DX, ADX, oscDX) %>% 
+    as.matrix()
+  ar <- aroon(price[ ,c('High', 'Low')], n = p) %>% extract(,3)
+  atr <- ATR(price, n = p, maType = "EMA") %>% extract(,1:2)
+  cci <- CCI(price[ ,2:4], n = p)
+  chv <- chaikinVolatility(price[ ,2:4], n = p)
+  cmo <- CMO(price[ ,'Med'], n = p)
+  macd <- MACD(price[ ,'Med'], 12, 26, 9) %>% as.data.frame() %>% mutate(., vsig = signal %>% 
+             diff %>% c(NA,.) %>% multiply_by(10)) %>% transmute(., sign = signal, vsig) %>% as.matrix()
+  rsi <- RSI(price[ ,'Med'], n = p)
+  stoh <- stoch(price[ ,2:4], nFastK = p, nFastD =3, nSlowD = 5, maType = "EMA") %>%
+                                as.data.frame() %>% 
+                                mutate(., oscK = fastK - fastD) %>%
+                                transmute(.,slowD, oscK) %>% 
+                                as.matrix()
+  smi <- SMI(price[ ,2:4],n = p, nFast = 2, nSlow = 25, nSig = 9)
+  kst <- KST(price[ ,4])%>% as.data.frame() %>% mutate(., oscKST = kst - signal) %>%
+                                transmute(.,oscKST) %>% as.matrix()
+  xavg<-EMA(price[,2],n=14)
+  trend<-price[,2]-xavg
+  Input <- cbind(adx, ar, atr, cci, chv, cmo, macd, 
+              rsi, stoh, smi, kst,xavg,trend)
+  return(Input)
+}
+```
+
+### As a target variable we take signals obtained with ZZ. The function calculating a zigzag and a signal:
+
+```{r}
+ZZ <- function(pr = price, ch = ch , mode="m") {
+  if (ch > 1) ch <- ch/(10 ^ (5 - 1))
+  if (mode == "m") {pr <- pr[ ,'Med']}
+  zz <- ZigZag(pr, change = ch, percent = F, 
+               retrace = F, lastExtreme = T)
+  n <- 1:length(zz)
+  dz <- zz %>% diff %>% c(., NA)
+  sig <- sign(dz)
+  for (i in n) { if (is.na(zz[i])) zz[i] = zz[i - 1]}
+  return(cbind(zz, sig))
+}
+```
+The function returns the matrix with two variables - in fact, the zigzag and the signal,obtained on the base of the zigzag angle in the range of [-1;1].We shift the signal by one bar to the left (towards future). 
+```{r}
+out <- ZZ(ch = 37, mode = "m")
+table(out[ ,2])
+```
+
+##Initialize data frame
+
+Let's write a function that will create the initial data frame, clean it from uncertain data (NA) and convert the target variable to the factor with two classes "-1" and "+1". This function combines previously written functions Input() and ZZ(). We will instantly crop the last 1000 bars that will be used to evaluate the quality of the model's prediction.
+
+###This specific signal will be used to train the neural network.
+```{r}
+form.data <- function(n = 14, z = 37, len = 1000){
+  x <- Input(p = n)
+  out <- ZZ(ch = z, mode = "m")
+  data <- cbind(x, y = out[ ,2]) %>% 
+    as.data.frame %>% head(., (nrow(x)-len))%>%na.omit
+  data$y <- as.factor(data$y)
+  return(data)
+}
+```
+
+### Deleting highly correlated variables
+
+We will delete variables with a correlation coefficient above 0.9 from our initial set. 
+We will write a function that will form the initial data frame, remove highly correlated variables and return clean data.
+
+```{r}
+data <- form.data(n = 14, z = 37)
+descCor <- cor(data[ ,-ncol(data)])
+summary(descCor[upper.tri(descCor)])
+highCor <-findCorrelation(descCor, cutoff = 0.9)
+highCor
+colnames(data[ ,highCor])
+data.f <- data[,-highCor]
+```
+
+###Selection of the most important variables 
+
+Important variables will be selected based on three indicators: global importance, local importance (in conjunction) and partial importance by class.Once executed, we will obtain three sets as a result:
+
+with best variables in contribution and interaction;
+with best variables for the class "-1"
+with best variables for the class "+1".
+
+###Divide the data into test and validation data
+```{r}
+inTrain<-createDataPartition(y = data.f$y, p = 0.8, list = FALSE) 
+training<-data.f[inTrain,]
+validation<-data.f[-inTrain,]
+```
+
+###Preprocess the data. determine pre-processing parameters and normalized input data.
+```{r}
+preProc<- preProcess(training[, -17], method = c("center", "scale","spatialSign"))
+trainPC<-predict(preProc,training[,-17])
+validPC<-predict(preProc,validation[,-17])
+modelFit<-randomUniformForest(training$y~.,data=trainPC,importance=TRUE,mtry=1,ntree=300,threads=2,nodesize=1)
+print(modelFit)
+```
+###select 10 most important variables in terms of contribution and interaction - best:
+```{r}
+imp.modelFit<-importance(modelFit,Xtest=validPC)
+```
+
+Best parameters with best sell and best buy
+
+```{r}
+best <- imp.modelFit$localVariableImportance$classVariableImportance %>% head(., 10) %>% rownames()
+
+best.sell <- partialImportance(X = validPC,imp.modelFit,whichClass = "-1",nLocalFeatures = 7) %>% row.names() %>% 
+as.numeric() %>% colnames(validPC)[.]
+
+best.buy <- partialImportance(X = validPC,imp.modelFit,whichClass = "1",nLocalFeatures = 7) %>% row.names() %>% 
+as.numeric() %>% colnames(validPC)[.]
+```
+
+###Create a list with three sets of predictors - best, best.buy, best.sell.
+```{r}
+dt <- list(best = best, buy = best.buy, sell = best.sell)
+```
+
+##Now selecting the best parameters for training using RBM.
+
+subsetting all of the best parameters
+
+```{r}
+datat<-data.f[,best]
+y<-data.f[,17]
+data.b<-cbind(datat,y)
+head(data.b,2)
+```
+```{r}
+x<-data.b[ ,-ncol(data.b)]
+y<-data.b[ , ncol(data.b)]
+```
+
+##Now do stratified random division for the best data
+```{r}
+t <- holdout(y = y, ratio = 0.8,mode = "stratified")
+train <- cbind(x[t$tr, ], y = y[t$tr])
+```
+
+##Now do rebalancing for train data to get the best output. balancing makes 0,1 equal for output y.
+
+```{r}
+Balancing<-function(DT){
+  #Calculate a table with a number of classes
+  cl<-table(DT[ ,ncol(DT)]);
+  #If the divergence is less than 15%, return the initial matrix
+  if(max(cl)/min(cl)<= 1.15) return(DT)
+  #Otherwise level by the greater side
+  DT<-if(max(cl)/min(cl)> 1.15){ 
+         upSample(x = DT[ ,-ncol(DT)],y = as.factor(DT[ , ncol(DT)]), yname = "Y")
+        }
+  #Convert ? (factor) into a number
+  DT$Y<-as.numeric(DT$Y)
+  #Recode ? from 1,2 into 0,1
+  DT$Y<-ifelse(DT$Y == 1, 0, 1)
+  #Convert dataframe to matrix
+  DT<-as.matrix(DT)
+  return(DT);
+}
+
+```
+
+###To run the above program we have to use.
+
+```{r}
+trainb<-Balancing(train)
+test <- cbind(x[t$ts, ], y = y[t$ts])
+```
+
+##Now preprocess the data for training neural network
+```{r}
+prepr<-preProcess(trainb[ ,best], method = "spatialSign")
+train = predict(prepr, trainb[ ,best])%>% cbind(., y = trainb$y)
+test =  predict(prepr, test[ ,best] %>% cbind(., y = test$y))
+DT <- list(train = train,test = test)
+```
+
+First, we create the deep architecture object named DArch, that includes the required number of RBM with parameters of preliminary training by default, and the neural network initiated with random weights and neuron activation function set by default. 
+
+
+```{r}
+y <- DT$train$y %>% classvec2classmat()
+
+```
+
+### create dataSet for training
+```{r}
+darch <- darch(DT$train[ ,best] %>% as.matrix(), y, c(10,20,2), rbm.batchSize = 50, rbm.numEpochs =100, darch.numEpochs = 0)
+```
+
+### testing accuracy of the system
+```{r}
+testAcc <- function(obj, typ = "bin")
+{
+  x.ts <- DT$test[ ,best] %>% as.matrix()
+  y.ts <- DT$test$y %>% as.integer() %>% subtract(1)
+  out <- predict(obj, newdata = x.ts, type = typ) 
+  out <- max.col(out)-1               
+  acc <- length(y.ts[y.ts == out])/length(y.ts) %>% round(., digits = 4)
+  return(list(Acc = acc, y.ts = y.ts, y = out))
+}
+```
+###Accuracy value on test data 
+```{r}
+yt<-testAcc(darch)
+yt$Acc
+```
+###Preparing the test for last 1000 bars for testing the strategy
+```{r}
+prepareTest <- function(n, z, norm, len = 1000)
+{
+  x <- Input(p = n ) %>% na.omit %>% extract( ,best) %>% tail(., len)
+  CO <- price[ ,"CO"] %>% tail(., len)
+  if (norm) {
+    x <- predict(prepr,x)
+  }
+  dt <- cbind(x = x, CO = CO) %>% as.data.frame()
+  return(dt)
+}
+```
+
+### Preparing data for the test
+```{r}
+DT.test <- prepareTest(n = 14, z = 37, T)
+testBal <- function(obj, typ = "bin") {
+  require(fTrading)
+  x <- DT.test[,best]
+  CO <- DT.test$CO
+  out <- predict(obj, newdata = x, type = typ) 
+  out <- max.col(out)-1 
+  sig <- ifelse(out == 0, -1, 1)
+  sig1 <- Hmisc::Lag(sig) %>% na.omit
+  bal <- cumsum(sig1 * tail(CO, length(sig1)))
+  K <- tail(bal, 1)/length(bal) * 10 ^ 4
+  Kmax <- max(bal)/which.max(bal) * 10 ^ 4
+  dd <- maxDrawDown(bal)
+  return(list(sig = sig, bal = bal, K = K,Kmax = Kmax, dd = dd))
+}
+```
+###Improving the result using moving average
+```{r}
+lt<-testBal(darch)
+bal<-lt$bal
+# signal on the last 1000 bars
+sig <- lt$sig[1:1000]
+# average from the balance line
+ma <-movavg(bal,16, "t")
+# momentum from the average 
+roc <-momentum(ma, 3)%>% na.omit
+# balance line deviation from the average
+dbal <- (bal - ma) %>% tail(., length(roc))
+# summarize two vectors
+dbr <- (roc + dbal) %>% as.matrix()
+# calculate correction signal
+sig.cor <- ifelse(dbr > 0, 1, -1) 
+# resulting signal
+S <- sig.cor * tail(sig, length(sig.cor))
+# balance on resulting signal
+Bal <- cumsum(S * (price[ ,"CO"]%>% tail(.,length(S))))
+# quality coefficient on the corrected signal
+Kk <- tail(Bal, 1)/length(Bal) * 10 ^ 4
+```
+###Ploting the corrected balance
+```{r}
+plot(c(NA,NA,NA,Bal), t="l")
+lines(bal, col= 2)
+lines(ma, col= 4)
+```
+
+
+
